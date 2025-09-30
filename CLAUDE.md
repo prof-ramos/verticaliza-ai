@@ -9,6 +9,15 @@ Sistema Python para processar editais de concursos públicos em PDF, extrair con
 ## Comandos de Desenvolvimento
 
 ### Instalação
+
+**Preferencial (UV):**
+```bash
+uv venv
+source .venv/bin/activate  # Linux/Mac
+uv pip install -r requirements.txt
+```
+
+**Alternativa (pip tradicional):**
 ```bash
 python3 -m venv venv
 source venv/bin/activate  # Linux/Mac

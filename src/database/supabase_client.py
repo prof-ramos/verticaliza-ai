@@ -1,6 +1,7 @@
 import os
 from typing import Optional, List, Dict, Any
-from supabase import create_client, Client
+from supabase import create_client
+from supabase.client import Client
 from dotenv import load_dotenv
 
 from .models import Edital, Cargo, ConteudoProgramatico, StatusProcessamento

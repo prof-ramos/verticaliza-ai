@@ -2,7 +2,7 @@ from pathlib import Path
 import time
 import json
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from src.extractors.pdf_extractor import PDFExtractor
 from src.extractors.url_handler import URLHandler
@@ -255,17 +255,50 @@ class EditalProcessor:
 if __name__ == "__main__":
     processor = EditalProcessor()
 
-    # Processar edital
-    success = processor.process(
-        pdf_source="edital_exemplo.pdf",
-        max_pages=50
-    )
+    # Verificar se há PDFs no diretório input_pdfs
+    input_dir = Path("input_pdfs")
+    pdf_files = list(input_dir.glob("*.pdf")) if input_dir.exists() else []
 
-    if success:
-        # Mostrar estatísticas
-        stats = processor.db.estatisticas_processamento()
-        print(f"\n📊 Estatísticas:")
-        print(f"  Total de editais: {stats['total_editais']}")
-        print(f"  Concluídos: {stats['concluidos']}")
-        print(f"  Erros: {stats['erros']}")
-        print(f"  Custo total: US$ {stats['custo_total_usd']:.2f}")
+    if not pdf_files:
+        print("❌ Nenhum PDF encontrado no diretório 'input_pdfs/'")
+        print("\n💡 Dica: Coloque arquivos PDF no diretório 'input_pdfs/' ou forneça uma URL\n")
+        print("Exemplo de uso programático:")
+        print("  processor.process('input_pdfs/edital.pdf')")
+        print("  processor.process('https://exemplo.com/edital.pdf')")
+        exit(1)
+
+    print(f"📂 Encontrados {len(pdf_files)} PDF(s) no diretório 'input_pdfs/'\n")
+
+    # Processar todos os PDFs encontrados
+    resultados = []
+    for pdf_file in pdf_files:
+        print(f"\n{'='*60}")
+        print(f"🔄 Processando: {pdf_file.name}")
+        print(f"{'='*60}\n")
+
+        success = processor.process(
+            pdf_source=str(pdf_file),
+            max_pages=None  # Processar todas as páginas
+        )
+
+        resultados.append({
+            'arquivo': pdf_file.name,
+            'sucesso': success
+        })
+
+    # Mostrar resumo
+    print(f"\n\n{'='*60}")
+    print("📊 RESUMO DO PROCESSAMENTO")
+    print(f"{'='*60}\n")
+
+    for resultado in resultados:
+        status = "✅ Sucesso" if resultado['sucesso'] else "❌ Falha"
+        print(f"  {status} - {resultado['arquivo']}")
+
+    # Mostrar estatísticas gerais
+    stats = processor.db.estatisticas_processamento()
+    print(f"\n📈 Estatísticas Gerais:")
+    print(f"  Total de editais: {stats['total_editais']}")
+    print(f"  Concluídos: {stats['concluidos']}")
+    print(f"  Erros: {stats['erros']}")
+    print(f"  Custo total: US$ {stats['custo_total_usd']:.2f}\n")
