@@ -1,6 +1,7 @@
 from pathlib import Path
 import time
 import json
+import asyncio
 from datetime import datetime
 from typing import Optional, List
 
@@ -19,7 +20,7 @@ class EditalProcessor:
         self.db = db or SupabaseManager()
         self.llm_client = OpenRouterClient()
 
-    def process(
+    async def process(
         self,
         pdf_source: str,
         max_pages: Optional[int] = None,
@@ -34,7 +35,7 @@ class EditalProcessor:
 
         # 2. Calcular hash e verificar duplicata
         file_hash = compute_file_hash(pdf_path)
-        edital_existente = self.db.edital_existe(file_hash)
+        edital_existente = await self.db.edital_existe(file_hash)
 
         if edital_existente:
             logger.info(
@@ -52,7 +53,7 @@ class EditalProcessor:
         )
 
         try:
-            edital_id = self.db.criar_edital(edital)
+            edital_id = await self.db.criar_edital(edital)
             logger.info(f"Edital criado no banco: {edital_id}")
         except Exception as e:
             logger.error("Erro ao criar edital no banco", e)
@@ -66,7 +67,7 @@ class EditalProcessor:
             metadata_basica = extractor.extract_metadata(pdf_path)
 
             # Atualizar total de páginas
-            self.db.atualizar_edital(edital_id, {
+            await self.db.atualizar_edital(edital_id, {
                 "total_paginas": metadata_basica["total_pages"],
                 "texto_extraido": text  # Armazenar texto completo
             })
@@ -78,25 +79,30 @@ class EditalProcessor:
                 extraction_time
             )
 
-            # 5. Processar com LLM - Metadados
+            # 5 e 6. Processar com LLM em paralelo - Metadados e Verticalização
             metadata_prompt = build_metadata_prompt(text[:15000])
-            metadata_json, model_used = self.llm_client.process_with_fallback(
+            vert_prompt = build_verticalization_prompt(text)
+
+            # Executar ambas chamadas LLM em paralelo
+            metadata_task = self.llm_client.process_with_fallback(
                 prompt=metadata_prompt,
                 system_prompt="Extraia informações precisas do edital em JSON válido."
             )
-            logger.log_llm_call(model_used, len(metadata_prompt), len(metadata_json))
-
-            # 6. Processar com LLM - Verticalização
-            vert_prompt = build_verticalization_prompt(text)
-            content_md, model_used = self.llm_client.process_with_fallback(
+            vert_task = self.llm_client.process_with_fallback(
                 prompt=vert_prompt,
                 system_prompt="Estruture o conteúdo mantendo hierarquia original."
             )
-            logger.log_llm_call(model_used, len(vert_prompt), len(content_md))
+
+            (metadata_json, model_used_meta), (content_md, model_used_vert) = await asyncio.gather(
+                metadata_task, vert_task
+            )
+
+            logger.log_llm_call(model_used_meta, len(metadata_prompt), len(metadata_json))
+            logger.log_llm_call(model_used_vert, len(vert_prompt), len(content_md))
 
             # 7. Parsear e salvar metadados
             metadata_dict = self._parse_metadata_json(metadata_json)
-            self.db.atualizar_edital(edital_id, {
+            await self.db.atualizar_edital(edital_id, {
                 "formato_prova": metadata_dict.get("formato_prova"),
                 "data_prova": metadata_dict.get("data_prova"),
                 "data_inscricao_inicio": metadata_dict.get("data_inscricao_inicio"),
@@ -104,22 +110,23 @@ class EditalProcessor:
                 "valor_inscricao": metadata_dict.get("valor_inscricao"),
                 "detalhes_discursiva": metadata_dict.get("detalhes_discursiva"),
                 "conteudo_verticalizado_md": content_md,
-                "modelo_usado": model_used,
+                "modelo_usado": model_used_vert,
             })
 
-            # 8. Salvar cargos
+            # 8 e 9. Salvar cargos e conteúdo em paralelo
             cargos = self._parse_cargos(metadata_dict, edital_id)
-            self.db.inserir_cargos(cargos)
-            logger.info(f"Inseridos {len(cargos)} cargos")
-
-            # 9. Salvar conteúdo programático
             conteudos = self._parse_conteudo_programatico(content_md, edital_id)
-            self.db.inserir_conteudo_programatico(conteudos)
-            logger.info(f"Inseridos {len(conteudos)} itens de conteúdo")
+
+            await asyncio.gather(
+                self.db.inserir_cargos(cargos),
+                self.db.inserir_conteudo_programatico(conteudos)
+            )
+
+            logger.info(f"Inseridos {len(cargos)} cargos e {len(conteudos)} itens de conteúdo")
 
             # 10. Finalizar processamento
             tempo_total = time.time() - start_time
-            self.db.finalizar_processamento(
+            await self.db.finalizar_processamento(
                 edital_id=edital_id,
                 sucesso=True,
                 dados_extras={
@@ -133,7 +140,7 @@ class EditalProcessor:
 
         except Exception as e:
             # Marcar como erro no banco
-            self.db.finalizar_processamento(
+            await self.db.finalizar_processamento(
                 edital_id=edital_id,
                 sucesso=False,
                 erro_mensagem=str(e)
@@ -252,7 +259,25 @@ class EditalProcessor:
         return conteudos
 
 
-if __name__ == "__main__":
+async def process_pdf_with_info(processor: EditalProcessor, pdf_file: Path) -> dict:
+    """Processa um PDF e retorna informações do resultado."""
+    print(f"\n{'='*60}")
+    print(f"🔄 Processando: {pdf_file.name}")
+    print(f"{'='*60}\n")
+
+    success = await processor.process(
+        pdf_source=str(pdf_file),
+        max_pages=None  # Processar todas as páginas
+    )
+
+    return {
+        'arquivo': pdf_file.name,
+        'sucesso': success
+    }
+
+
+async def main():
+    """Função principal com processamento paralelo de PDFs."""
     processor = EditalProcessor()
 
     # Verificar se há PDFs no diretório input_pdfs
@@ -263,28 +288,31 @@ if __name__ == "__main__":
         print("❌ Nenhum PDF encontrado no diretório 'input_pdfs/'")
         print("\n💡 Dica: Coloque arquivos PDF no diretório 'input_pdfs/' ou forneça uma URL\n")
         print("Exemplo de uso programático:")
-        print("  processor.process('input_pdfs/edital.pdf')")
-        print("  processor.process('https://exemplo.com/edital.pdf')")
+        print("  await processor.process('input_pdfs/edital.pdf')")
+        print("  await processor.process('https://exemplo.com/edital.pdf')")
         exit(1)
 
-    print(f"📂 Encontrados {len(pdf_files)} PDF(s) no diretório 'input_pdfs/'\n")
+    print(f"📂 Encontrados {len(pdf_files)} PDF(s) no diretório 'input_pdfs/'")
+    print(f"⚡ Processamento paralelo habilitado\n")
 
-    # Processar todos os PDFs encontrados
+    # Processar todos os PDFs em paralelo (máximo 3 simultâneos para não sobrecarregar)
+    max_concurrent = 3
     resultados = []
-    for pdf_file in pdf_files:
-        print(f"\n{'='*60}")
-        print(f"🔄 Processando: {pdf_file.name}")
-        print(f"{'='*60}\n")
 
-        success = processor.process(
-            pdf_source=str(pdf_file),
-            max_pages=None  # Processar todas as páginas
+    for i in range(0, len(pdf_files), max_concurrent):
+        batch = pdf_files[i:i + max_concurrent]
+        batch_results = await asyncio.gather(
+            *[process_pdf_with_info(processor, pdf) for pdf in batch],
+            return_exceptions=True
         )
 
-        resultados.append({
-            'arquivo': pdf_file.name,
-            'sucesso': success
-        })
+        # Processar resultados do batch
+        for result in batch_results:
+            if isinstance(result, Exception):
+                print(f"❌ Erro: {result}")
+                resultados.append({'arquivo': 'desconhecido', 'sucesso': False})
+            else:
+                resultados.append(result)
 
     # Mostrar resumo
     print(f"\n\n{'='*60}")
@@ -296,9 +324,25 @@ if __name__ == "__main__":
         print(f"  {status} - {resultado['arquivo']}")
 
     # Mostrar estatísticas gerais
-    stats = processor.db.estatisticas_processamento()
+    stats = await processor.db.estatisticas_processamento()
     print(f"\n📈 Estatísticas Gerais:")
     print(f"  Total de editais: {stats['total_editais']}")
     print(f"  Concluídos: {stats['concluidos']}")
     print(f"  Erros: {stats['erros']}")
-    print(f"  Custo total: US$ {stats['custo_total_usd']:.2f}\n")
+    print(f"  Custo total: US$ {stats['custo_total_usd']:.2f}")
+
+    # Mostrar estatísticas de cache LLM
+    cache_stats = processor.llm_client.get_cache_stats()
+    if not cache_stats.get("cache_disabled"):
+        print(f"\n💾 Cache LLM:")
+        print(f"  Hits: {cache_stats['hits']}")
+        print(f"  Misses: {cache_stats['misses']}")
+        print(f"  Taxa de acerto: {cache_stats['hit_rate_percent']:.2f}%")
+        print(f"  Tamanho: {cache_stats['cache_size']} entradas\n")
+
+    # Fechar conexões
+    await processor.db.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
